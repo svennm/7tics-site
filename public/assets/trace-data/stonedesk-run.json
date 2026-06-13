@@ -1,0 +1,48 @@
+{
+  "meta": {
+    "task": "STO-234: Verify TRB London cell exit cleanly closed",
+    "models": {
+      "planner": "ollama/cogito-2.1:671b-cloud",
+      "judge":   "ollama/cogito-2.1:671b-cloud"
+    },
+    "duration_ms": 14500,
+    "ts": "replay"
+  },
+  "events": [
+    {"t":    0, "stream":"planner",  "type":"token", "value":"<plan>\n"},
+    {"t":  150, "stream":"planner",  "type":"token", "value":"  <step>Read TRB London exit log</step>\n"},
+    {"t":  450, "stream":"planner",  "type":"token", "value":"  <step>Verify HaltActor state file</step>\n"},
+    {"t":  750, "stream":"planner",  "type":"token", "value":"  <step>Check OCO close acks for open positions</step>\n"},
+    {"t": 1100, "stream":"planner",  "type":"token", "value":"</plan>\n"},
+    {"t": 1300, "stream":"planner",  "type":"token", "value":"<thinking>If TRB closed before 23:00 UTC the carry-flatten rule applies...</thinking>\n"},
+    {"t": 1700, "stream":"planner",  "type":"token", "value":"<execution>\n  step 1: search_repos\n</execution>\n"},
+
+    {"t": 2200, "stream":"defense", "type":"strip",  "tag":"thinking",  "reason":"phantom-XML wrapper not in plan schema"},
+    {"t": 2350, "stream":"defense", "type":"strip",  "tag":"execution", "reason":"executor controls steps, not planner output"},
+    {"t": 2500, "stream":"defense", "type":"keep",   "tag":"plan",      "reason":"valid plan tag"},
+    {"t": 2700, "stream":"defense", "type":"keep",   "tag":"step",      "reason":"valid step nodes"},
+
+    {"t": 3000, "stream":"executor", "type":"tool_call",   "name":"search_repos", "args":{"q":"trb london exit"}},
+    {"t": 3700, "stream":"executor", "type":"tool_result", "status":200, "size":"12 results", "duration_ms":700},
+
+    {"t": 4200, "stream":"executor", "type":"tool_call",   "name":"read_file", "args":{"path":"strategies/trb_london_range.py"}},
+    {"t": 5000, "stream":"executor", "type":"tool_result", "status":200, "size":"4.2 KB",     "duration_ms":800},
+
+    {"t": 5500, "stream":"executor", "type":"tool_call",   "name":"read_file", "args":{"path":"/var/lib/nautilus-strategy/lf/halt_state.json"}},
+    {"t": 6100, "stream":"executor", "type":"tool_result", "status":200, "size":"312 B",      "duration_ms":600},
+
+    {"t": 6700, "stream":"executor", "type":"tool_call",   "name":"git_log",   "args":{"since":"-1d","grep":"halt"}},
+    {"t": 7400, "stream":"executor", "type":"tool_result", "status":200, "size":"7 commits",  "duration_ms":700},
+
+    {"t": 8000, "stream":"executor", "type":"tool_call",   "name":"shell",     "args":{"cmd":"journalctl -u nautilus-strategy@lf -n 50 --since 23:00"}},
+    {"t": 9200, "stream":"executor", "type":"tool_result", "status":200, "size":"50 lines",   "duration_ms":1200},
+
+    {"t":11000, "stream":"judge",    "type":"verdict",
+                "value":"PASS",
+                "confidence":0.86,
+                "cited":["strategies/trb_london_range.py:142","halt_state.json"],
+                "reasoning":"TRB London cell closed cleanly at 22:59:47 UTC. HaltActor consumed signal, state file shows halted=true. No naked positions detected. EOD flatten ran on schedule."},
+
+    {"t":14500, "stream":"system",   "type":"end"}
+  ]
+}
