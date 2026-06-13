@@ -127,6 +127,7 @@ pre { padding: 16px; overflow-x: auto; line-height: 1.5; }
 .badge.live .dot { animation: pulse 1.5s ease-in-out infinite; }
 .badge.production { color: var(--live); }
 .badge.opensource { color: var(--gold); }
+.badge.essay { color: var(--accent); }
 
 @keyframes pulse {
   0%, 100% { opacity: 0.4; }
