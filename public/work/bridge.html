@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MT5 Bridge — vendor-agnostic broker routing · 7tics</title>
+<meta name="description" content="File-bridge architecture between Nautilus and multiple MT5 brokers. Swap-point pattern, hedging-account OCO, zero-downtime broker swap.">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+
+<header class="header">
+  <a class="brand" href="/" style="text-decoration:none">← 7TICS</a>
+  <nav>
+    <a href="/#work">work</a>
+    <a href="/about">about</a>
+    <a href="/#contact">contact</a>
+  </nav>
+  <a class="cta" href="https://calendly.com/CALENDLY_HANDLE/20min" target="_blank" rel="noopener">Book a call →</a>
+</header>
+
+<main class="section">
+
+<div data-reveal>
+  <div style="display:flex;gap:14px;align-items:center;margin-bottom:18px;">
+    <span class="badge production"><span class="dot"></span>In production</span>
+    <span style="font-size:11px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;">work / bridge</span>
+  </div>
+  <div class="wordmark" style="font-size:42px">MT5 BRIDGE</div>
+  <p class="pitch" style="margin-top:14px">Vendor-agnostic order routing layer between Nautilus strategies and multiple MT5 brokers. File-bridge EA, swap-point pattern, OCO that survives hedging-account quirks.</p>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">1 · The problem</div>
+<p>Every MT5 broker behaves differently. FundedNext and E8 use hedging accounts that silently ignore the <code>position=</code> field in OCO closes — submitting <code>TRADE_ACTION_PENDING</code> opens an opposing position instead of closing one, leaving naked exposure that survives the day. Wine-hosted MT5 terminals on Linux VPS die within minutes if you forget <code>DISPLAY=:1 XAUTHORITY=...</code> in the systemd unit. Single-process bridges create a single point of failure. The stack needs a routing layer that abstracts all of this.</p>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">2 · The architecture</div>
+<pre>
+        ┌────────────────────────────────────┐
+        │      Nautilus strategy node        │
+        │  (TRB London / Tokyo cells)        │
+        └────────────────┬───────────────────┘
+                         │ submit_order
+                         ▼
+        ┌────────────────────────────────────┐
+        │     ExecutionService daemon        │
+        │  (out-of-process, supervised)      │
+        └────────────────┬───────────────────┘
+                         │
+            ┌────────────┼────────────┐
+            ▼            ▼            ▼
+        ┌───────┐    ┌───────┐    ┌───────┐
+        │rpyc   │    │file-  │    │ direct│
+        │relay  │    │bridge │    │  MT5  │
+        │:18812 │    │ EA    │    │ python│
+        └───┬───┘    └───┬───┘    └───┬───┘
+            │            │            │
+            ▼            ▼            ▼
+        per-book STONEDESK_BRIDGE_DIR isolation
+          (LF / FN / E8 / Derrick)
+                         │
+                         ▼
+                  ┌──────────────┐
+                  │ Wine MT5     │
+                  │ + custom EA  │
+                  └──────────────┘
+</pre>
+
+<ul>
+  <li><strong>File-bridge EA (MQL5):</strong> watches <code>orders_in/</code> directory, executes via TRADE_ACTION_SLTP for hedging-account OCO closes, writes acks to <code>orders_ack/</code>.</li>
+  <li><strong>Python relay (rpyc :18812):</strong> alternate transport for brokers that allow direct MT5 process control (LF).</li>
+  <li><strong>Swap-point pattern:</strong> single attribute on <code>self._submit_mt5</code> — duck-typed mt5 module is a drop-in replacement. Switching transports is one line.</li>
+  <li><strong>STONEDESK_BRIDGE_DIR per book:</strong> default <code>/var/lib/stonedesk/orders</code> doesn't match EA's <code>MQL5/Files</code> — override per book or orders silently never reach EA.</li>
+</ul>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">3 · The code</div>
+
+<p style="margin-bottom:8px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:2px">OCO close on hedging brokers — TRADE_ACTION_SLTP</p>
+<pre>// nautilus-mt5-journal — fixed in commit dc46f36
+def close_oco(self, position_id, sl_price, tp_price):
+    # WRONG (silently opens opposing position on FN/E8):
+    #   request = {"action": TRADE_ACTION_PENDING, "position": position_id, ...}
+    # RIGHT:
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": position_id,
+        "sl": sl_price,
+        "tp": tp_price,
+    }
+    return self.mt5.order_send(request)
+</pre>
+
+<p style="margin:24px 0 8px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:2px">Swap-point pattern — single attribute, duck-typed module</p>
+<pre># router config picks transport at startup
+if config.transport == "file_bridge":
+    self._submit_mt5 = FileBridgeMT5(orders_dir=os.environ["STONEDESK_BRIDGE_DIR"])
+elif config.transport == "rpyc":
+    self._submit_mt5 = rpyc.connect("localhost", 18812).root
+else:
+    import MetaTrader5 as mt5
+    self._submit_mt5 = mt5
+# strategy code only knows self._submit_mt5.order_send(req)
+</pre>
+
+<p style="margin:24px 0 8px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:2px">MQL5 EA — atomic file write (string by value, not by ref)</p>
+<pre>// MQL5 'const string &' rejects rvalues — error 200 on inline build
+// WRONG: AtomicWrite("/path", BuildPayload());
+// RIGHT: pass string by value
+bool AtomicWrite(const string path, const string payload) {
+    string tmp = path + ".tmp";
+    int h = FileOpen(tmp, FILE_WRITE | FILE_TXT);
+    if (h == INVALID_HANDLE) return false;
+    FileWriteString(h, payload);
+    FileClose(h);
+    return FileMove(tmp, 0, path, FILE_REWRITE);
+}
+</pre>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">4 · The outcome</div>
+<div class="stack-strip" style="margin-bottom:18px">
+  <span class="chip">4 brokers concurrent</span>
+  <span class="chip">Zero-downtime swap</span>
+  <span class="chip">Session-aware preflight</span>
+  <span class="chip">WatchdogSec=900 for M10 bars</span>
+</div>
+<ul>
+  <li>OCO TRADE_ACTION_SLTP fix eliminated naked-position incidents on FN/E8 hedging accounts.</li>
+  <li>File-bridge swap-point pattern enabled zero-downtime transport migration between rpyc and file modes.</li>
+  <li>Preflight session-aware check skips tick-freshness during Fri-22 → Sun-22 UTC weekend closure; killed systemd-restart TEMPFAIL loops.</li>
+</ul>
+</div>
+
+<div data-reveal style="margin-top:64px;display:flex;justify-content:space-between;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);">
+  <a href="/work/stonedesk">← stonedesk</a>
+  <span>mt5 bridge</span>
+  <a href="/work/gitnexus">gitnexus →</a>
+</div>
+
+</main>
+
+<footer class="footer">© 2026 · 7tics · Svenn Mivedor</footer>
+
+<script src="/assets/theme.js"></script>
+<script src="/assets/nav.js"></script>
+</body>
+</html>

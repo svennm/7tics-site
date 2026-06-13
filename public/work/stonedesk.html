@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StoneDesk — live prop trading agents · 7tics</title>
+<meta name="description" content="Solo-built prop trading firm with 3 production agents on Claude / Ollama, orchestrating live execution across multiple brokers.">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+
+<header class="header">
+  <a class="brand" href="/" style="text-decoration:none">← 7TICS</a>
+  <nav>
+    <a href="/#work">work</a>
+    <a href="/about">about</a>
+    <a href="/#contact">contact</a>
+  </nav>
+  <a class="cta" href="https://calendly.com/CALENDLY_HANDLE/20min" target="_blank" rel="noopener">Book a call →</a>
+</header>
+
+<main class="section">
+
+<div data-reveal>
+  <div style="display:flex;gap:14px;align-items:center;margin-bottom:18px;">
+    <span class="badge live"><span class="dot"></span>Live</span>
+    <span style="font-size:11px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;">work / stonedesk</span>
+  </div>
+  <div class="wordmark" style="font-size:42px">STONEDESK</div>
+  <p class="pitch" style="margin-top:14px">Solo-built prop trading firm with 3 production agents orchestrating live multi-broker execution. Running on FundedNext, E8, and LiteFinance since 2026-05.</p>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">1 · The problem</div>
+<p>Prop trading at scale requires more than a strategy. You need an ops layer that survives broker quirks (hedging-account OCO behavior differs from netting), withstands wine-MT5 fragility (terminals die without DISPLAY+XAUTHORITY), coordinates multiple agents without one stepping on another, and enforces kill rules that the model itself can't override. Off-the-shelf agent frameworks don't cover any of this. I built the stack from scratch.</p>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">2 · The architecture</div>
+<pre>
+                     ┌─────────────────┐
+                     │   DeskHead      │  (cogito-2.1:671b)
+                     │   playbook +    │
+                     │   daily diary   │
+                     └────────┬────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+  ┌──────────┐         ┌──────────┐         ┌──────────────┐
+  │    QD    │         │Researcher│         │  HaltActor   │
+  │  exec    │         │ defend + │         │  governance  │
+  │ engineer │         │  extend  │         │ -1.5σ kill   │
+  └────┬─────┘         └────┬─────┘         └──────┬───────┘
+       │                    │                      │
+       ▼                    ▼                      ▼
+  ┌──────────────────────────────────────────────────┐
+  │           paperclip-stonedesk  (fork)            │
+  │  planexec adapter · phantom-XML strip · OpenCode │
+  └─────────────────────────┬────────────────────────┘
+                            │
+                            ▼
+  ┌──────────────────────────────────────────────────┐
+  │             nautilus-mt5-journal                 │
+  │  TRB strategies · OCO via TRADE_ACTION_SLTP      │
+  └─────────────────────────┬────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        ▼                   ▼                   ▼
+  ┌──────────┐        ┌──────────┐        ┌──────────┐
+  │ FundedNext│       │   E8     │        │LiteFinance│
+  │  MT5+EA   │       │ MT5+EA   │        │  MT5+EA   │
+  └──────────┘        └──────────┘        └──────────┘
+</pre>
+
+<ul>
+  <li><strong>3-agent stack:</strong> DeskHead (playbook owner, daily diary), QD (live exec engineer, MT5 plumbing, 95% execution-match KPI), Researcher (defend + extend + ρ/cov + time-aware + 11-item self-validation checklist).</li>
+  <li><strong>paperclip-stonedesk fork</strong> with planexec adapter, phantom-XML strip defense, OpenCode local adapter patched to Ollama-only.</li>
+  <li><strong>HaltActor governance:</strong> state file at <code>/var/lib/nautilus-strategy/&lt;book&gt;/halt_state.json</code>, -1.5σ kill rule, operator pause is BUSINESS only — trading halts owned by HaltActor + DeskHead.</li>
+  <li><strong>Multi-broker execution</strong> via file-bridge EA architecture — see <a href="/work/bridge">MT5 bridge case study</a>.</li>
+</ul>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">3 · The code</div>
+
+<p style="margin-bottom:8px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:2px">Planner-executor adapter — format-json injection</p>
+<pre>// adapter forces structured output, kills XML drift
+const planResponse = await ollama.chat({
+  model: 'cogito-2.1:671b-cloud',
+  format: 'json',
+  messages: [
+    { role: 'system', content: PLANNER_FEW_SHOT },
+    { role: 'user',   content: task.prompt },
+  ],
+});
+const plan = JSON.parse(planResponse.message.content);
+// 30% XML rate → 0% under format:json + few-shot (G1 verdict 2026-06-09)
+</pre>
+
+<p style="margin:24px 0 8px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:2px">phantom-XML strip — defense layer</p>
+<pre>// strip-server/src/lib/phantom-strip.ts
+const PHANTOM_TAGS = ['thinking', 'execution', 'reasoning', 'inner_monologue'];
+export function stripPhantom(raw: string): { cleaned: string; stripped: Tag[] } {
+  const stripped: Tag[] = [];
+  let cleaned = raw;
+  for (const tag of PHANTOM_TAGS) {
+    const re = new RegExp(`&lt;${tag}&gt;[\\s\\S]*?&lt;/${tag}&gt;`, 'gi');
+    if (re.test(cleaned)) {
+      stripped.push({ tag, reason: 'phantom-XML wrapper not in plan schema' });
+      cleaned = cleaned.replace(re, '');
+    }
+  }
+  return { cleaned, stripped };
+}
+</pre>
+
+<p style="margin:24px 0 8px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:2px">HaltActor — state file pattern</p>
+<pre># strategies/trb_london_range.py
+HALT_STATE_PATH = f"/var/lib/nautilus-strategy/{book}/halt_state.json"
+def is_halted():
+    try:
+        with open(HALT_STATE_PATH) as f:
+            return json.load(f).get("halted", False)
+    except FileNotFoundError:
+        return False
+# strategy code never decides halts; HaltActor + DeskHead own it
+</pre>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">4 · The outcome</div>
+<div class="stack-strip" style="margin-bottom:18px">
+  <span class="chip">3 brokers live</span>
+  <span class="chip">Multi-week runtime</span>
+  <span class="chip">-1.5σ kill rule shipped</span>
+  <span class="chip">60-day agent eval window</span>
+  <span class="chip">Zero broker-side outages caused by stack</span>
+</div>
+<ul>
+  <li>Phantom-XML defense reduced cogito-2.1 zero-tool sessions from 57.5% to 0% on G1 smoke.</li>
+  <li>OCO TRADE_ACTION_SLTP fix eliminated naked positions on hedging brokers (STO-49 critical fixed nautilus-mt5-journal@dc46f36).</li>
+  <li>Auto-PATCH from EVIDENCE: contract closed the "claim-without-PATCH" loop where agents narrated done without firing API calls.</li>
+</ul>
+</div>
+
+<div data-reveal style="margin-top:64px;display:flex;justify-content:space-between;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);">
+  <a href="/">← all work</a>
+  <span>stonedesk</span>
+  <a href="/work/bridge">mt5 bridge →</a>
+</div>
+
+</main>
+
+<footer class="footer">© 2026 · 7tics · Svenn Mivedor</footer>
+
+<script src="/assets/theme.js"></script>
+<script src="/assets/nav.js"></script>
+</body>
+</html>

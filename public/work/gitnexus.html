@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitNexus — code intelligence MCP · 7tics</title>
+<meta name="description" content="MCP server that gives Claude a graph view of any codebase. Symbols, call relationships, execution flows, impact analysis.">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+
+<header class="header">
+  <a class="brand" href="/" style="text-decoration:none">← 7TICS</a>
+  <nav>
+    <a href="/#work">work</a>
+    <a href="/about">about</a>
+    <a href="/#contact">contact</a>
+  </nav>
+  <a class="cta" href="https://calendly.com/CALENDLY_HANDLE/20min" target="_blank" rel="noopener">Book a call →</a>
+</header>
+
+<main class="section">
+
+<div data-reveal>
+  <div style="display:flex;gap:14px;align-items:center;margin-bottom:18px;">
+    <span class="badge opensource"><span class="dot"></span>Open source</span>
+    <span style="font-size:11px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;">work / gitnexus</span>
+  </div>
+  <div class="wordmark" style="font-size:42px">GITNEXUS</div>
+  <p class="pitch" style="margin-top:14px">MCP server that gives Claude a graph view of any codebase — symbols, callers, callees, execution flows, impact analysis. Used by Claude Code on this very project.</p>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">1 · The problem</div>
+<p>Cold-loading a 100,000-line codebase into an LLM context window is lossy and slow. The model reads the same files repeatedly, can't see who calls what, and loses track of execution flows. Embeddings help search but don't capture call graphs. What's needed is a queryable structural index — a graph — that an LLM can interrogate with cheap targeted queries instead of dumping raw text.</p>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">2 · The architecture</div>
+<pre>
+       ┌──────────────────────────────────┐
+       │      Tree-sitter parsers         │
+       │  (Python, JS, MQL5, Go, …)       │
+       └──────────────┬───────────────────┘
+                      │ AST + symbols + relationships
+                      ▼
+       ┌──────────────────────────────────┐
+       │     SQLite graph index           │
+       │  symbols · relations · processes │
+       └──────────────┬───────────────────┘
+                      │
+                      ▼
+       ┌──────────────────────────────────┐
+       │      MCP tools (exposed to AI)   │
+       │  impact · context · query        │
+       │  rename · detect_changes         │
+       └──────────────┬───────────────────┘
+                      │
+                      ▼
+       ┌──────────────────────────────────┐
+       │   Claude Code · Cursor · agents  │
+       └──────────────────────────────────┘
+</pre>
+
+<ul>
+  <li><strong>Tree-sitter</strong> parses every supported language into a typed AST; symbol + relationship extractors run per language.</li>
+  <li><strong>SQLite graph schema:</strong> <code>symbols</code> (functions / classes / methods), <code>relationships</code> (calls / inherits / imports / references), <code>processes</code> (named execution flows).</li>
+  <li><strong>MCP tools:</strong> <code>impact</code> returns blast radius before edits, <code>context</code> returns full symbol context, <code>query</code> runs concept search across execution flows, <code>rename</code> understands the call graph.</li>
+  <li><strong>Real usage today:</strong> indexed NBA Playoff Terminal (1,315 symbols / 4,198 relationships), StoneDesk infra, 7tics_intelligence, this very site.</li>
+</ul>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">3 · The code</div>
+
+<p style="margin-bottom:8px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:2px">Impact analysis — blast-radius query</p>
+<pre>// gitnexus_impact({target: "symbolName", direction: "upstream"})
+// returns direct callers + affected processes + risk score
+function impact(target, direction = 'upstream') {
+  const symbol = db.symbols.find(name = target);
+  if (!symbol) return { error: 'not found' };
+  const edges = db.relationships.where({
+    [direction === 'upstream' ? 'to' : 'from']: symbol.id,
+    type: 'calls',
+  });
+  const processes = db.processes.touchedBy(symbol.id);
+  return {
+    target: symbol.name,
+    direct: edges.map(e => db.symbols.byId(e.from)),
+    processes: processes,
+    risk: classifyRisk(edges.length, processes.length),
+  };
+}
+</pre>
+
+<p style="margin:24px 0 8px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:2px">MCP tool registration</p>
+<pre>// MCP server boilerplate — Claude / Cursor connect to this
+server.tool('gitnexus_impact', {
+  description: 'Run impact analysis on a symbol before editing it',
+  inputSchema: {
+    target:    z.string(),
+    direction: z.enum(['upstream', 'downstream']).default('upstream'),
+  },
+}, async ({ target, direction }) => {
+  const result = impact(target, direction);
+  return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+});
+</pre>
+
+<p style="margin:24px 0 8px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:2px">Process discovery — named execution flows</p>
+<pre>// 'processes' are walks across the call graph that share a name
+// e.g. "trade entry flow" = run_entry_signal → check_filters → submit_order → write_journal
+// SQL: graph walk from entry symbol, breadth-first, capped at depth 6
+WITH RECURSIVE flow(symbol_id, depth) AS (
+  SELECT id, 0 FROM symbols WHERE name = ?
+  UNION ALL
+  SELECT r.to_symbol_id, flow.depth + 1
+  FROM flow JOIN relationships r ON r.from_symbol_id = flow.symbol_id
+  WHERE flow.depth < 6 AND r.type IN ('calls', 'invokes')
+)
+SELECT DISTINCT symbols.* FROM flow JOIN symbols ON symbols.id = flow.symbol_id;
+</pre>
+</div>
+
+<div data-reveal>
+<div class="section-label" style="margin-top:48px">4 · The outcome</div>
+<div class="stack-strip" style="margin-bottom:18px">
+  <span class="chip">Real codebases indexed</span>
+  <span class="chip">2,325 symbols (7tics)</span>
+  <span class="chip">3,051 relationships</span>
+  <span class="chip">46 execution flows</span>
+  <span class="chip">Open source MCP</span>
+</div>
+<ul>
+  <li>Claude Code on this project enforces "run impact analysis before editing any symbol" — backed by GitNexus.</li>
+  <li>Saves token cost vs cold-loading source: queries are cheap targeted reads, not 100k-line dumps.</li>
+  <li>Catches downstream breakage in PRs by surfacing impact before edits land.</li>
+</ul>
+
+<p style="margin-top:24px;font-size:12px;color:var(--dim)">→ Source: <a href="https://github.com/svennm/gitnexus" target="_blank" rel="noopener">github.com/svennm/gitnexus</a></p>
+</div>
+
+<div data-reveal style="margin-top:64px;display:flex;justify-content:space-between;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);">
+  <a href="/work/bridge">← mt5 bridge</a>
+  <span>gitnexus</span>
+  <a href="/">all work →</a>
+</div>
+
+</main>
+
+<footer class="footer">© 2026 · 7tics · Svenn Mivedor</footer>
+
+<script src="/assets/theme.js"></script>
+<script src="/assets/nav.js"></script>
+</body>
+</html>
