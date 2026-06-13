@@ -53,6 +53,9 @@ class TracePlayer {
     this.refs.resetBtn?.addEventListener('click', () => {
       this.elapsed = 0;
       this.loopHoldUntil = 0;
+      this.lastTs = null;
+      this.playing = true;
+      if (this.refs.playBtn) this.refs.playBtn.textContent = '⏸';
       this._render(initialState());
     });
     this.refs.speedSel?.addEventListener('change', (e) => {
