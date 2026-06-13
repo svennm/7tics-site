@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The silent MT5 OCO bug that opens opposite positions on hedging accounts · 7tics</title>
+<meta name="description" content="MT5 prop firm accounts run in hedging mode. A specific OCO close pattern silently opens NEW opposite positions instead of closing. Here is the bug, the proof, and the one-line fix.">
+<meta name="author" content="Svenn Mivedor">
+<meta property="og:title" content="MT5 prop firms run hedging mode. Your OCO close is opening NEW trades.">
+<meta property="og:description" content="A specific TRADE_ACTION_PENDING pattern that works on netting accounts silently fails on hedging — opens an opposing position instead of closing. Here is the fix.">
+<meta property="og:type" content="article">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="stylesheet" href="/assets/style.css">
+<style>
+  .article-meta { display:flex; gap:14px; align-items:center; font-size:11px; color:var(--dim); letter-spacing:2px; text-transform:uppercase; margin-bottom:18px; }
+  .article-meta .sep { opacity:.4; }
+  article h2 { font-family:var(--font-disp); font-size:18px; letter-spacing:3px; text-transform:uppercase; color:var(--text); margin:48px 0 14px 0; padding-bottom:8px; border-bottom:1px solid var(--border); }
+  article h3 { font-size:14px; color:var(--accent); margin:28px 0 10px 0; letter-spacing:1px; text-transform:uppercase; }
+  article p { margin:12px 0; max-width:72ch; }
+  article ul, article ol { max-width:72ch; padding-left:22px; }
+  article li { margin:6px 0; }
+  article pre { max-width:100%; }
+  .tldr { background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:var(--radius); padding:18px 22px; margin:24px 0; }
+  .tldr .label { font-family:var(--font-disp); font-size:11px; letter-spacing:3px; color:var(--accent); margin-bottom:8px; }
+  .callout-bad { border-left-color:var(--danger); }
+  .callout-good { border-left-color:var(--success); }
+  .compare { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:18px 0; }
+  .compare > div { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius-lg); padding:0; overflow:hidden; }
+  .compare h4 { padding:10px 16px; margin:0; font-size:11px; letter-spacing:2px; text-transform:uppercase; color:var(--dim); border-bottom:1px solid var(--border); background:var(--panel-hi); }
+  .compare pre { border:0; background:transparent; margin:0; padding:14px 16px; }
+  .compare .bad h4 { color:var(--danger); }
+  .compare .good h4 { color:var(--success); }
+  @media (max-width:780px) { .compare { grid-template-columns:1fr; } }
+  .article-footer { margin-top:64px; padding-top:32px; border-top:1px solid var(--border); display:flex; gap:24px; flex-wrap:wrap; align-items:center; }
+  .article-footer .author { flex:1; min-width:280px; }
+  .article-footer .author .name { font-family:var(--font-disp); font-size:14px; letter-spacing:3px; text-transform:uppercase; color:var(--text); }
+  .article-footer .author .bio { font-size:13px; color:var(--dim); margin-top:6px; max-width:48ch; }
+</style>
+</head>
+<body>
+
+<header class="header">
+  <a class="brand" href="/" style="text-decoration:none">← 7TICS</a>
+  <nav>
+    <a href="/#work">work</a>
+    <a href="/about">about</a>
+    <a href="/#contact">contact</a>
+  </nav>
+  <a class="cta" href="https://calendly.com/svennmivedor/discovery-call" target="_blank" rel="noopener">Book a call →</a>
+</header>
+
+<main class="section">
+
+<article data-reveal>
+
+  <div class="article-meta">
+    <span>writing</span>
+    <span class="sep">·</span>
+    <span>2026-06-13</span>
+    <span class="sep">·</span>
+    <span>MT5 · MQL5 · prop firms</span>
+  </div>
+
+  <div class="wordmark" style="font-size:34px; line-height:1.15;">
+    MT5 PROP FIRMS RUN<br>HEDGING MODE. YOUR<br>OCO CLOSE IS OPENING<br>NEW TRADES.
+  </div>
+
+  <p class="pitch" style="margin-top:20px; max-width:72ch;">
+    A specific OCO close pattern that works fine on netting MT5 accounts silently fails on hedging accounts &mdash; the broker ignores the <code>position</code> field, treats the request as a brand new pending order, and opens an opposing position instead of closing the original. Your account looks like it&rsquo;s churning. It is &mdash; but not how you think.
+  </p>
+
+  <div class="tldr">
+    <div class="label">TL;DR</div>
+    <ul style="margin:0;">
+      <li>If your prop firm account is on a hedging server &mdash; most are &mdash; and you send <code>TRADE_ACTION_PENDING</code> with a <code>position</code> field expecting it to manage an open position, MT5 will <strong>not</strong> manage that position. It opens a new pending order. When it fires, you have two opposing positions, not zero.</li>
+      <li>The fix: use <code>TRADE_ACTION_SLTP</code> to arm or modify stops on an existing position. Use <code>TRADE_ACTION_DEAL</code> with <code>position=&lt;ticket&gt;</code> to close it. Never use <code>TRADE_ACTION_PENDING</code> for either.</li>
+      <li>Detection: scan open positions for <code>sl == 0</code> when your strategy thinks stops are armed. If you find any, you&rsquo;ve been hit.</li>
+    </ul>
+  </div>
+
+  <h2>1 &middot; The scene</h2>
+
+  <p>I run a live algo across FundedNext, E8, Derrick Capital, and LiteFinance. Four books, one Nautilus Trader engine, multiple MT5 terminals on a Linux VPS via Wine. The strategy is a London / Tokyo session range breakout with bracket orders: entry, stop, take-profit, all submitted together.</p>
+
+  <p>On three of the four accounts I started seeing something that didn&rsquo;t add up. Positions that the strategy logs marked as <em>closed by stop</em> were showing up in MT5 as <em>still open, no stop attached</em>. Sometimes a closed position would appear to have spawned a second, opposite one. The journal would say <code>OCO armed</code>. The terminal would say otherwise.</p>
+
+  <p>It only happened on three accounts. The fourth &mdash; the LiteFinance one &mdash; behaved exactly as the strategy expected. That asymmetry was the clue.</p>
+
+  <h2>2 &middot; Why three brokers and not the fourth</h2>
+
+  <p>MT5 servers run in one of two position-accounting modes:</p>
+
+  <ul>
+    <li><strong>Netting.</strong> One position per symbol. New trades net into the existing position. If you&rsquo;re long 1 lot EURUSD and you sell 1 lot, you end at flat. Standard for regulated retail and some prop setups.</li>
+    <li><strong>Hedging.</strong> Many positions per symbol, each with its own ticket. New trades open new positions. If you&rsquo;re long 1 lot EURUSD and you sell 1 lot, you now hold both a long and a short. Standard for most prop firms (FundedNext, E8, FTMO, Derrick, and others), because it lets traders run multiple strategies on the same symbol without one cannibalising the other.</li>
+  </ul>
+
+  <p>The strategy code didn&rsquo;t care which mode the account was in &mdash; or so I thought. The OCO bracket would arm stops on the open position by sending a <code>MqlTradeRequest</code> with <code>action = TRADE_ACTION_PENDING</code> and a <code>position</code> field pointing at the open ticket. On the netting account this silently worked. On hedging it silently broke.</p>
+
+  <h2>3 &middot; What MT5 actually does with that request</h2>
+
+  <p>Here is the <code>MqlTradeRequest</code> structure as it&rsquo;s defined in the MQL5 docs:</p>
+
+<pre><code>struct MqlTradeRequest {
+  ENUM_TRADE_REQUEST_ACTIONS action;       // what the request is
+  ulong                       magic;
+  ulong                       order;
+  string                      symbol;
+  double                      volume;
+  double                      price;
+  double                      stoplimit;
+  double                      sl;
+  double                      tp;
+  ulong                       deviation;
+  ENUM_ORDER_TYPE             type;
+  ENUM_ORDER_TYPE_FILLING     type_filling;
+  ENUM_ORDER_TYPE_TIME        type_time;
+  datetime                    expiration;
+  string                      comment;
+  ulong                       position;    // open position ticket
+  ulong                       position_by;
+};</code></pre>
+
+  <p>The <code>action</code> field is the verb. The interesting verbs for managing an existing position are:</p>
+
+  <ul>
+    <li><code>TRADE_ACTION_DEAL</code> &mdash; place a market order. With <code>position</code> set, the broker closes that specific position.</li>
+    <li><code>TRADE_ACTION_SLTP</code> &mdash; modify SL / TP of an open position. The <code>position</code> field selects which one.</li>
+    <li><code>TRADE_ACTION_PENDING</code> &mdash; place a brand new pending order at <code>price</code>. The <code>position</code> field is, on hedging servers, simply <em>ignored</em>.</li>
+  </ul>
+
+  <p>That last point is the bug. On a netting server, the broker has only one position per symbol, so even if it ignores <code>position</code> on a pending order, the pending order&rsquo;s implicit side-effect &mdash; when it fires &mdash; nets against the existing exposure and the account ends up flat. The bug never surfaces.</p>
+
+  <p>On a hedging server, a pending order is just a pending order. When it triggers, it opens a brand new position in the opposite direction. The original position stays open with no stop attached. You now hold <strong>two opposing tickets</strong>. Spread cost doubled. Risk model broken. Worse: your journal still says &ldquo;OCO armed&rdquo; because the broker returned <code>retcode = TRADE_RETCODE_DONE</code> &mdash; the pending order was accepted, just not as the operation you thought.</p>
+
+  <h2>4 &middot; The broken code and the fix</h2>
+
+  <p>This is roughly what the broken arm-stops path looked like in Python (over rpyc to a Wine-hosted MT5 terminal):</p>
+
+  <div class="compare">
+    <div class="bad">
+      <h4>✗ Broken &mdash; opens opposite position on hedging</h4>
+<pre><code>req = {
+    "action":   mt5.TRADE_ACTION_PENDING,
+    "symbol":   symbol,
+    "volume":   pos.volume,
+    "type":     mt5.ORDER_TYPE_SELL_STOP,
+    "price":    stop_price,
+    "sl":       0.0,
+    "tp":       0.0,
+    "deviation": 10,
+    "magic":    pos.magic,
+    "position": pos.ticket,    # ignored on hedging
+    "comment":  "OCO_STOP",
+}
+result = mt5.order_send(req)
+# retcode == TRADE_RETCODE_DONE
+# pending order created — NOT a stop on pos.ticket
+</code></pre>
+    </div>
+    <div class="good">
+      <h4>✓ Fixed &mdash; arms SL/TP on the open position</h4>
+<pre><code>req = {
+    "action":   mt5.TRADE_ACTION_SLTP,
+    "symbol":   symbol,
+    "position": pos.ticket,
+    "sl":       stop_price,
+    "tp":       tp_price,
+    "magic":    pos.magic,
+}
+result = mt5.order_send(req)
+# retcode == TRADE_RETCODE_DONE
+# stop attached to pos.ticket — verifiable via
+# mt5.positions_get(ticket=pos.ticket)[0].sl
+</code></pre>
+    </div>
+  </div>
+
+  <p>If you actually want to close the position (instead of arming a stop), the correct verb is <code>TRADE_ACTION_DEAL</code> with the opposite side and the <code>position</code> field set:</p>
+
+<pre><code>req = {
+    "action":       mt5.TRADE_ACTION_DEAL,
+    "symbol":       symbol,
+    "volume":       pos.volume,
+    "type":         mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+    "position":     pos.ticket,
+    "deviation":    10,
+    "type_filling": mt5.ORDER_FILLING_IOC,
+    "magic":        pos.magic,
+    "comment":      "CLOSE",
+}
+result = mt5.order_send(req)
+</code></pre>
+
+  <p>For OCO brackets specifically &mdash; the original sin behind this whole post &mdash; arm the SL with <code>TRADE_ACTION_SLTP</code> at order-fill time, then let the broker manage the close natively. Don&rsquo;t hand-roll a pending order pretending to be a stop.</p>
+
+  <h2>5 &middot; How to detect if you&rsquo;ve been hit</h2>
+
+  <p>Three signals, in order of how quickly they&rsquo;ll find the damage:</p>
+
+  <ol>
+    <li><strong>Naked positions.</strong> Scan <code>mt5.positions_get()</code> for any position where <code>sl == 0.0</code> while your strategy thinks stops are armed. Any hit = you&rsquo;ve been bitten on that ticket. Reconcile by arming the stop with <code>TRADE_ACTION_SLTP</code> immediately.</li>
+    <li><strong>Pending-order count mismatch.</strong> If your strategy submitted N OCOs and <code>mt5.orders_get()</code> shows N pending orders sitting on the book that you didn&rsquo;t expect, they&rsquo;re the ghosts. Cancel them with <code>TRADE_ACTION_REMOVE</code> before any trigger.</li>
+    <li><strong>Opposing positions on the same symbol.</strong> On hedging this is the smoking gun. If your strategy only ever takes one side at a time and you see both a long and a short ticket on the same symbol, the ghost pending fired.</li>
+  </ol>
+
+  <p>A small reconciler script that runs on a 30-second timer, scans for these three conditions, and emits to whatever monitoring you have, will save you real money. I run one called <code>naked_position_reconciler.py</code> as a systemd timer on the trading host.</p>
+
+  <h2>6 &middot; Why this isn&rsquo;t already a stack-overflow answer</h2>
+
+  <p>Three reasons it stays silent:</p>
+
+  <ul>
+    <li>Most algo retail trades netting accounts. The bug never surfaces; their code &ldquo;works.&rdquo;</li>
+    <li>Most prop traders trade discretionary through the UI, not through MQL5. They never assemble an <code>MqlTradeRequest</code> by hand.</li>
+    <li>Most prop algo traders use <code>OrderSend</code> wrappers from libraries like MetaTrader5 Python or various Expert Advisor templates, which paper over the distinction &mdash; until they don&rsquo;t. The wrappers work on the developer&rsquo;s netting demo and quietly mis-behave on the customer&rsquo;s hedging live.</li>
+  </ul>
+
+  <p>The intersection of <em>algo developer</em> &times; <em>hedging prop account</em> &times; <em>hand-rolled bracket orders</em> is small. If you&rsquo;re in it, you&rsquo;ve probably been bleeding from this for months and assumed it was your strategy.</p>
+
+  <h2>7 &middot; The bigger pattern</h2>
+
+  <p>The MQL5 docs technically describe all of this, in a reference page nobody reads end-to-end. The bug is not that the platform behaves badly &mdash; it&rsquo;s that <code>TRADE_RETCODE_DONE</code> is returned for a request that did the wrong thing. The broker did what it was told. You told it the wrong thing. There&rsquo;s no error to grep.</p>
+
+  <p>This is the class of bug that algo systems are full of: success-shaped failures, where every layer in the stack returns OK and the only thing that knows it went wrong is the P&amp;L. The defense isn&rsquo;t better logs in the calling code. The defense is a reconciler that asks the broker the ground-truth question (&ldquo;is this position armed?&rdquo;) and refuses to trust the request you sent.</p>
+
+  <p>Same principle behind why my whole trading rig runs an out-of-band <code>HaltActor</code> that owns trading halts independent of the strategy that requested them, and a <code>preflight</code> script that re-checks ticket state before every bar. You can&rsquo;t close the loop in-process. The process is the thing lying to you.</p>
+
+  <h2>8 &middot; If this hit you</h2>
+
+  <p>If you found this because your prop account is bleeding and you think it might be the same bug:</p>
+
+  <ol>
+    <li>Run <code>mt5.positions_get()</code> right now. Print every ticket where <code>sl == 0</code>. Arm them with <code>TRADE_ACTION_SLTP</code>.</li>
+    <li>Print every <code>mt5.orders_get()</code> result. Cancel any pending you didn&rsquo;t place yourself.</li>
+    <li>Audit your OCO / bracket code for <code>TRADE_ACTION_PENDING</code> with a <code>position</code> field. Replace per the patterns above.</li>
+    <li>Add a 30-second naked-position reconciler. Even if you fix the calling code, the reconciler catches the next class of success-shaped failure.</li>
+  </ol>
+
+  <p>I deal with this category of bug for a living. If your stack has shipped two months of P&amp;L into the void and you want a second pair of eyes, the calendar link is in the header.</p>
+
+  <div class="article-footer">
+    <div class="author">
+      <div class="name">SVENN MIVEDOR</div>
+      <div class="bio">AI-native quant. Live prop trading systems, multi-broker MT5 plumbing, agent ops on production books. <a href="/#work">See the work →</a></div>
+    </div>
+    <a class="cta" href="https://calendly.com/svennmivedor/discovery-call" target="_blank" rel="noopener" style="font-family:var(--font-disp); padding:12px 24px;">Book a call →</a>
+  </div>
+
+</article>
+
+</main>
+
+</body>
+</html>
