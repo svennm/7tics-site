@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>One `kill wineserver` and four prop accounts go dark · 7tics</title>
+<meta name="description" content="Multi-broker MT5 on Linux/Wine. A bridge-restart script aimed at one python process killed the entire Wine prefix — and every MT5 terminal under it. Here is the cascade, the regex that caused it, and the fix.">
+<meta name="author" content="Svenn Mivedor">
+<meta property="og:title" content="One `kill wineserver` and four prop accounts go dark.">
+<meta property="og:description" content="A multi-broker MT5 stack runs each terminal in its own Wine install — but they all share one wineserver. Kill it by accident and every book drops. The cascade, the regex, the fix.">
+<meta property="og:type" content="article">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="stylesheet" href="/assets/style.css">
+<style>
+  .article-meta { display:flex; gap:14px; align-items:center; font-size:11px; color:var(--dim); letter-spacing:2px; text-transform:uppercase; margin-bottom:18px; }
+  .article-meta .sep { opacity:.4; }
+  article h2 { font-family:var(--font-disp); font-size:18px; letter-spacing:3px; text-transform:uppercase; color:var(--text); margin:48px 0 14px 0; padding-bottom:8px; border-bottom:1px solid var(--border); }
+  article h3 { font-size:14px; color:var(--accent); margin:28px 0 10px 0; letter-spacing:1px; text-transform:uppercase; }
+  article p { margin:12px 0; max-width:72ch; }
+  article ul, article ol { max-width:72ch; padding-left:22px; }
+  article li { margin:6px 0; }
+  article pre { max-width:100%; }
+  .tldr { background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:var(--radius); padding:18px 22px; margin:24px 0; }
+  .tldr .label { font-family:var(--font-disp); font-size:11px; letter-spacing:3px; color:var(--accent); margin-bottom:8px; }
+  .callout-bad { border-left-color:var(--danger); }
+  .callout-good { border-left-color:var(--success); }
+  .compare { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:18px 0; }
+  .compare > div { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius-lg); padding:0; overflow:hidden; }
+  .compare h4 { padding:10px 16px; margin:0; font-size:11px; letter-spacing:2px; text-transform:uppercase; color:var(--dim); border-bottom:1px solid var(--border); background:var(--panel-hi); }
+  .compare pre { border:0; background:transparent; margin:0; padding:14px 16px; }
+  .compare .bad h4 { color:var(--danger); }
+  .compare .good h4 { color:var(--success); }
+  @media (max-width:780px) { .compare { grid-template-columns:1fr; } }
+  .article-footer { margin-top:64px; padding-top:32px; border-top:1px solid var(--border); display:flex; gap:24px; flex-wrap:wrap; align-items:center; }
+  .article-footer .author { flex:1; min-width:280px; }
+  .article-footer .author .name { font-family:var(--font-disp); font-size:14px; letter-spacing:3px; text-transform:uppercase; color:var(--text); }
+  .article-footer .author .bio { font-size:13px; color:var(--dim); margin-top:6px; max-width:48ch; }
+</style>
+</head>
+<body>
+
+<header class="header">
+  <a class="brand" href="/" style="text-decoration:none">← 7TICS</a>
+  <nav>
+    <a href="/#work">work</a>
+    <a href="/about">about</a>
+    <a href="/#contact">contact</a>
+  </nav>
+  <a class="cta" href="https://calendly.com/svennmivedor/discovery-call" target="_blank" rel="noopener">Book a call &rarr;</a>
+</header>
+
+<main class="section">
+
+<article data-reveal>
+
+  <div class="article-meta">
+    <span>writing</span>
+    <span class="sep">&middot;</span>
+    <span>2026-06-14</span>
+    <span class="sep">&middot;</span>
+    <span>Wine &middot; MT5 &middot; Linux ops</span>
+  </div>
+
+  <div class="wordmark" style="font-size:34px; line-height:1.15;">
+    ONE `KILL WINESERVER`<br>AND FOUR PROP<br>ACCOUNTS GO DARK.
+  </div>
+
+  <p class="pitch" style="margin-top:20px; max-width:72ch;">
+    I run four MT5 terminals on one Linux VPS under Wine &mdash; one per broker, each in its own Wine install, each with its own bridge. They look isolated. They are not. They share a single <code>wineserver</code>. A bridge-restart script aimed at one python process grabbed the wineserver PID instead. The whole rig went dark in one signal.
+  </p>
+
+  <div class="tldr">
+    <div class="label">TL;DR</div>
+    <ul style="margin:0;">
+      <li>On Linux, <code>wineserver</code> is the shared kernel of a Wine prefix. Killing it cascades to <strong>every</strong> wine-hosted process &mdash; terminals, EAs, helper python, everything.</li>
+      <li>The trap: <code>ss -ltnp</code> on a wine-hosted listener lists <em>both</em> the python.exe owner <em>and</em> the wineserver in <code>users:((&hellip;))</code>. The order is not stable. A <code>grep -oE 'pid=[0-9]+' | head -1</code> picks one or the other &mdash; coin flip.</li>
+      <li>Fix: match on the process name, not the position. <code>grep -oE 'python\.exe.+pid=[0-9]+'</code> then extract. Or safer: <code>pkill -f "port=$PORT"</code>.</li>
+      <li>Recovery: <code>DISPLAY=:1 wine "C:\Program Files\MetaTrader N\terminal64.exe" &amp;</code> per terminal. With "remember password", they auto-login. Allow ~60s per broker for IPC to come back. Any login popup = VNC required.</li>
+    </ul>
+  </div>
+
+  <h2>1 &middot; The setup that looks isolated</h2>
+
+  <p>Four prop accounts, four brokers, one VPS. Each broker is pinned to its own MT5 installation under the Wine prefix &mdash; literally <code>MetaTrader 5</code>, <code>MetaTrader 6</code>, <code>MetaTrader 7</code>, <code>MetaTrader 8</code> as separate program-files folders. Each terminal has its own login. In front of each terminal is a tiny rpyc bridge: a Wine-hosted <code>python.exe</code> binding <code>127.0.0.1:18812&hellip;18815</code>, exposing the MT5 API to the Nautilus engine running natively on Linux.</p>
+
+  <p>From the Linux side it looks like four independent stacks. Different binaries. Different ports. Different systemd units (<code>nautilus-journal@e8</code>, <code>@derrick</code>, <code>@fn</code>, <code>@lf</code>). If one breaks, the other three should keep running. That's how isolation works, right?</p>
+
+  <p>Yes &mdash; except for one shared dependency I&rsquo;d stopped thinking about. The Wine prefix.</p>
+
+  <h2>2 &middot; What wineserver actually is</h2>
+
+  <p>Wine is not an emulator (the W in WINE: &ldquo;Wine Is Not&hellip;&rdquo;). It&rsquo;s a re-implementation of the Win32 API on top of Linux syscalls. To pull that off, every wine-hosted process needs a coordination layer that fakes the things Windows processes assume exist &mdash; a registry, the inter-process Win32 sync primitives (events, mutexes, named pipes), the desktop, file-handle semantics. That coordinator is <code>wineserver</code>.</p>
+
+  <p>One <code>wineserver</code> per Wine prefix. All wine-hosted processes attached to that prefix talk to the same wineserver over a unix-domain socket. If wineserver disappears, the processes attached to it are no longer running on anything &mdash; their fake-Windows backbone is gone. Wine&rsquo;s shutdown path is to kill them all.</p>
+
+  <p>Which means: four separate <code>MetaTrader 5/6/7/8</code> installations is just folder-level separation. They&rsquo;re all attached to <code>/root/.wine</code>. They all share one wineserver. They are one blast radius.</p>
+
+  <h2>3 &middot; The regex that did it</h2>
+
+  <p>The bridge-restart script does what you&rsquo;d guess: find the python process listening on the port, kill it, restart it. The lookup looked like this:</p>
+
+  <div class="compare">
+    <div class="bad">
+      <h4>&times; Broken &mdash; coin flip between python and wineserver</h4>
+<pre><code>PORT=18814
+PID=$(ss -ltnp \
+  | grep ":$PORT" \
+  | grep -oE 'pid=[0-9]+' \
+  | head -1 \
+  | cut -d= -f2)
+kill "$PID"
+</code></pre>
+    </div>
+    <div class="good">
+      <h4>&check; Fixed &mdash; match the python.exe owner explicitly</h4>
+<pre><code>PORT=18814
+PID=$(ss -ltnp \
+  | awk -v p=":$PORT" '$4 ~ p' \
+  | grep -oE 'python\.exe.+pid=[0-9]+' \
+  | grep -oE 'pid=[0-9]+' \
+  | head -1 \
+  | cut -d= -f2)
+kill "$PID"
+
+# Or, safer still:
+pkill -f "port=$PORT"
+</code></pre>
+    </div>
+  </div>
+
+  <p>Run <code>ss -ltnp</code> on a wine-hosted listener and the <code>users:</code> column for that socket lists every process holding a handle to it. On a Wine python listener that&rsquo;s typically two entries: the python.exe itself and the wineserver coordinator. The order in the output is not stable across kernel versions, ss versions, and even across consecutive runs.</p>
+
+  <p>The script had been running fine for weeks. On 2026-05-24, on a routine bridge restart for the E8 book on port <code>18814</code>, the regex grabbed wineserver. <code>kill</code> returned 0. Within a second, every terminal under <code>/root/.wine</code> &mdash; E8, Derrick, FundedNext, LiteFinance &mdash; was gone. Four books offline at the same time.</p>
+
+  <h2>4 &middot; What the cascade actually looks like</h2>
+
+  <p>From journalctl during the incident:</p>
+
+<pre><code>... bridge-restart[12345]: killing port=18814 pid=8821
+... systemd[1]: nautilus-journal@e8.service: rpyc connection lost, restarting
+... systemd[1]: nautilus-journal@derrick.service: rpyc connection lost, restarting
+... systemd[1]: nautilus-journal@fn.service: rpyc connection lost, restarting
+... systemd[1]: nautilus-journal@lf.service: rpyc connection lost, restarting
+... spread-recorder-universe[33301]: ECONNRESET on :18812, :18813, :18814, :18815
+</code></pre>
+
+  <p>One <code>kill</code>. Four journal services losing their rpyc peer in the same second. The spread recorder dropping all four lanes. No live order routing on any book. If any account had been mid-trade, the journal would catch up on reconnect &mdash; but the strategy can&rsquo;t arm new stops on a terminal that isn&rsquo;t there.</p>
+
+  <p>The recovery is mechanical but slow. Per terminal:</p>
+
+<pre><code>DISPLAY=:1 wine "C:\Program Files\MetaTrader 5\terminal64.exe" &amp;
+DISPLAY=:1 wine "C:\Program Files\MetaTrader 6\terminal64.exe" &amp;
+DISPLAY=:1 wine "C:\Program Files\MetaTrader 7\terminal64.exe" &amp;
+DISPLAY=:1 wine "C:\Program Files\MetaTrader 8\terminal64.exe" &amp;
+</code></pre>
+
+  <p>With cached creds and &ldquo;remember password&rdquo; ticked on each install, the terminals auto-login on cold start. Allow ~60 seconds per terminal for broker IPC to converge. If <em>any</em> of them throws a login dialog &mdash; expired session, server-side reset, password rotation &mdash; you need VNC into <code>:1</code> to click through. There&rsquo;s no headless recovery once a modal is up.</p>
+
+  <h2>5 &middot; Why this is a class of bug, not a one-off</h2>
+
+  <p>The mistake feels stupid in hindsight (it always does). But the shape of it generalises:</p>
+
+  <ul>
+    <li><strong>Wine prefix</strong> &mdash; one wineserver, many processes. Kill the coordinator, kill everything.</li>
+    <li><strong>Docker container</strong> &mdash; one PID 1, many child processes. <code>kill -9</code> the PID-1 and the kernel reaps the lot.</li>
+    <li><strong>systemd cgroup</strong> &mdash; one unit, many processes. <code>systemctl kill --kill-who=all</code> hits every member.</li>
+    <li><strong>k8s pod</strong> &mdash; one shared network and IPC namespace. Restart any container and the pod IP and ephemeral state churn for all of them.</li>
+    <li><strong>tmux session</strong> &mdash; one server, many panes. <code>tmux kill-server</code> nukes every pane on the box.</li>
+  </ul>
+
+  <p>The pattern is: any time you have a <em>shared-lifecycle container</em> of processes, the unit-of-isolation is the container, not the leaf process. If your tooling reasons at the leaf level (one port, one python, one connection) but the kernel reasons at the container level (one wineserver, one PID 1, one cgroup), you have a blast-radius mismatch waiting to surface.</p>
+
+  <p>The defense is not better <code>kill</code> commands. The defense is teaching your scripts about the container they&rsquo;re inside, and refusing to send signals to processes that aren&rsquo;t leaves of it. <code>pkill -f "port=$PORT"</code> works because the match is exact: only your own python.exe ever carries that <code>port=</code> token in its argv. The wineserver doesn&rsquo;t.</p>
+
+  <h2>6 &middot; The audit, if you run this stack</h2>
+
+  <p>If you have a Wine-hosted MT5 rig and you want to be sure this can&rsquo;t bite you:</p>
+
+  <ol>
+    <li><strong>Grep your ops scripts for <code>ss -ltnp | grep | head -1</code> patterns.</strong> Any positional pick on a wine-hosted port is a coin flip. Replace with name-matched extraction or <code>pkill -f</code>.</li>
+    <li><strong>Tag your bridges in argv.</strong> Start each bridge as <code>python.exe bridge.py port=18814 broker=e8</code> so <code>pkill -f "port=18814"</code> uniquely identifies one process.</li>
+    <li><strong>Order your service shutdown.</strong> Stop journal + recorder services before touching bridges. Restart in reverse. A bridge restart with live consumers attached just trips reconnect storms.</li>
+    <li><strong>Document the prefix as the unit of blast.</strong> &ldquo;Never kill wineserver&rdquo; goes next to &ldquo;never kill MT5&rdquo; in your ops runbook. They&rsquo;re the same class of rule.</li>
+    <li><strong>Drill the cold-start.</strong> Time how long four terminals take from <code>wine terminal64.exe</code> to first journal trade. Mine is around four minutes. If yours is &ldquo;I don&rsquo;t know, I&rsquo;ve never had to do it,&rdquo; you&rsquo;ll find out at the worst moment.</li>
+  </ol>
+
+  <h2>7 &middot; The bigger principle</h2>
+
+  <p>I&rsquo;ve been writing a lot lately about <a href="/writing/oco-hedging-bug">success-shaped failures</a> &mdash; bugs where every layer returns OK and only the P&amp;L knows something went wrong. This is a different beast: a <em>scope-shaped</em> failure. The signal you sent was correct. It was just sent to a process whose scope was wider than you thought.</p>
+
+  <p>The fix isn&rsquo;t cleverer code. It&rsquo;s respecting that the kernel groups processes by lifecycle, not by intent. Your <em>intent</em> was to bounce one bridge. The kernel saw a signal to the prefix coordinator. The kernel was right; the intent was wrong.</p>
+
+  <p>If you&rsquo;re running multi-broker prop infra on Linux and your ops scripts have grown organically from &ldquo;one terminal that worked once&rdquo; into &ldquo;four terminals nobody&rsquo;s touched in months,&rdquo; I&rsquo;d bet there&rsquo;s at least one shared-lifecycle trap like this hiding in your runbook. Audit before you find out the way I did.</p>
+
+  <div class="article-footer">
+    <div class="author">
+      <div class="name">SVENN MIVEDOR</div>
+      <div class="bio">AI-native quant. Live prop trading systems, multi-broker MT5 plumbing, agent ops on production books. <a href="/#work">See the work &rarr;</a></div>
+    </div>
+    <a class="cta" href="https://calendly.com/svennmivedor/discovery-call" target="_blank" rel="noopener" style="font-family:var(--font-disp); padding:12px 24px;">Book a call &rarr;</a>
+  </div>
+
+</article>
+
+</main>
+
+</body>
+</html>
